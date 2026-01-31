@@ -7,6 +7,7 @@ import {
   resolvePinnedHostname,
   SsrFBlockedError,
 } from "../../infra/net/ssrf.js";
+import { ProxyAgent } from "undici";
 import type { Dispatcher } from "undici";
 import { stringEnum } from "../schema/typebox.js";
 import type { AnyAgentTool } from "./common.js";
@@ -44,6 +45,43 @@ const DEFAULT_FETCH_USER_AGENT =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_2) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
 
 const FETCH_CACHE = new Map<string, CacheEntry<Record<string, unknown>>>();
+
+let cachedProxyAgent: ProxyAgent | undefined;
+let cachedProxyUrl: string | undefined;
+let configuredProxyUrl: string | undefined;
+
+function resolveConfiguredProxyUrl(cfg?: OpenClawConfig): string | undefined {
+  const candidate =
+    cfg?.channels && "telegram" in cfg.channels ? (cfg.channels as any).telegram?.proxy : undefined;
+  return typeof candidate === "string" && candidate.trim() ? candidate.trim() : undefined;
+}
+
+function resolveProxyUrl(): string | undefined {
+  const value =
+    process.env.ALL_PROXY ??
+    process.env.all_proxy ??
+    process.env.HTTPS_PROXY ??
+    process.env.https_proxy ??
+    process.env.HTTP_PROXY ??
+    process.env.http_proxy ??
+    "";
+  const trimmed = value.trim();
+  if (trimmed) return trimmed;
+  return configuredProxyUrl;
+}
+
+function resolveProxyAgent(): ProxyAgent | undefined {
+  const proxyUrl = resolveProxyUrl();
+  if (!proxyUrl) return undefined;
+  if (cachedProxyAgent && cachedProxyUrl === proxyUrl) return cachedProxyAgent;
+  cachedProxyUrl = proxyUrl;
+  cachedProxyAgent = new ProxyAgent(proxyUrl);
+  return cachedProxyAgent;
+}
+
+function shouldCloseDispatcher(dispatcher: Dispatcher): boolean {
+  return !(dispatcher instanceof ProxyAgent);
+}
 
 const WebFetchSchema = Type.Object({
   url: Type.String({ description: "HTTP or HTTPS URL to fetch." }),
@@ -210,8 +248,12 @@ async function fetchWithRedirects(params: {
       throw new Error("Invalid URL: must be http or https");
     }
 
+    // Always run SSRF checks on the target hostname.
+    // If a proxy is configured, route the request through it (common in CN networks),
+    // but still keep SSRF protection by validating each hop/redirect.
     const pinned = await resolvePinnedHostname(parsedUrl.hostname);
-    const dispatcher = createPinnedDispatcher(pinned);
+    const proxyAgent = resolveProxyAgent();
+    const dispatcher: Dispatcher = proxyAgent ?? createPinnedDispatcher(pinned);
     let res: Response;
     try {
       res = await fetch(parsedUrl.toString(), {
@@ -226,29 +268,39 @@ async function fetchWithRedirects(params: {
         dispatcher,
       } as RequestInit);
     } catch (err) {
-      await closeDispatcher(dispatcher);
+      if (shouldCloseDispatcher(dispatcher)) {
+        await closeDispatcher(dispatcher);
+      }
       throw err;
     }
 
     if (isRedirectStatus(res.status)) {
       const location = res.headers.get("location");
       if (!location) {
-        await closeDispatcher(dispatcher);
+        if (shouldCloseDispatcher(dispatcher)) {
+          await closeDispatcher(dispatcher);
+        }
         throw new Error(`Redirect missing location header (${res.status})`);
       }
       redirectCount += 1;
       if (redirectCount > params.maxRedirects) {
-        await closeDispatcher(dispatcher);
+        if (shouldCloseDispatcher(dispatcher)) {
+          await closeDispatcher(dispatcher);
+        }
         throw new Error(`Too many redirects (limit: ${params.maxRedirects})`);
       }
       const nextUrl = new URL(location, parsedUrl).toString();
       if (visited.has(nextUrl)) {
-        await closeDispatcher(dispatcher);
+        if (shouldCloseDispatcher(dispatcher)) {
+          await closeDispatcher(dispatcher);
+        }
         throw new Error("Redirect loop detected");
       }
       visited.add(nextUrl);
       void res.body?.cancel();
-      await closeDispatcher(dispatcher);
+      if (shouldCloseDispatcher(dispatcher)) {
+        await closeDispatcher(dispatcher);
+      }
       currentUrl = nextUrl;
       continue;
     }
@@ -602,6 +654,7 @@ export function createWebFetchTool(options?: {
   sandboxed?: boolean;
 }): AnyAgentTool | null {
   const fetch = resolveFetchConfig(options?.config);
+  configuredProxyUrl = resolveConfiguredProxyUrl(options?.config);
   if (!resolveFetchEnabled({ fetch, sandboxed: options?.sandboxed })) {
     return null;
   }

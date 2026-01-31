@@ -1,4 +1,5 @@
 import { Type } from "@sinclair/typebox";
+import { ProxyAgent, fetch as undiciFetch } from "undici";
 
 import type { OpenClawConfig } from "../../config/config.js";
 import { formatCliCommand } from "../../cli/command-format.js";
@@ -31,6 +32,39 @@ const OPENROUTER_KEY_PREFIXES = ["sk-or-"];
 const SEARCH_CACHE = new Map<string, CacheEntry<Record<string, unknown>>>();
 const BRAVE_FRESHNESS_SHORTCUTS = new Set(["pd", "pw", "pm", "py"]);
 const BRAVE_FRESHNESS_RANGE = /^(\d{4}-\d{2}-\d{2})to(\d{4}-\d{2}-\d{2})$/;
+
+let cachedProxyAgent: ProxyAgent | undefined;
+let cachedProxyUrl: string | undefined;
+let configuredProxyUrl: string | undefined;
+
+function resolveConfiguredProxyUrl(cfg?: MoltbotConfig): string | undefined {
+  const candidate =
+    cfg?.channels && "telegram" in cfg.channels ? (cfg.channels as any).telegram?.proxy : undefined;
+  return typeof candidate === "string" && candidate.trim() ? candidate.trim() : undefined;
+}
+
+function resolveProxyUrl(): string | undefined {
+  const value =
+    process.env.ALL_PROXY ??
+    process.env.all_proxy ??
+    process.env.HTTPS_PROXY ??
+    process.env.https_proxy ??
+    process.env.HTTP_PROXY ??
+    process.env.http_proxy ??
+    "";
+  const trimmed = value.trim();
+  if (trimmed) return trimmed;
+  return configuredProxyUrl;
+}
+
+function resolveProxyAgent(): ProxyAgent | undefined {
+  const proxyUrl = resolveProxyUrl();
+  if (!proxyUrl) return undefined;
+  if (cachedProxyAgent && cachedProxyUrl === proxyUrl) return cachedProxyAgent;
+  cachedProxyUrl = proxyUrl;
+  cachedProxyAgent = new ProxyAgent(proxyUrl);
+  return cachedProxyAgent;
+}
 
 const WebSearchSchema = Type.Object({
   query: Type.String({ description: "Search query string." }),
@@ -318,7 +352,9 @@ async function runPerplexitySearch(params: {
 }): Promise<{ content: string; citations: string[] }> {
   const endpoint = `${params.baseUrl.replace(/\/$/, "")}/chat/completions`;
 
-  const res = await fetch(endpoint, {
+  const dispatcher = resolveProxyAgent();
+
+  const res = await undiciFetch(endpoint, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -336,10 +372,11 @@ async function runPerplexitySearch(params: {
       ],
     }),
     signal: withTimeout(undefined, params.timeoutSeconds * 1000),
+    dispatcher,
   });
 
   if (!res.ok) {
-    const detail = await readResponseText(res);
+    const detail = await readResponseText(res as unknown as Response);
     throw new Error(`Perplexity API error (${res.status}): ${detail || res.statusText}`);
   }
 
@@ -417,17 +454,20 @@ async function runWebSearch(params: {
     url.searchParams.set("freshness", params.freshness);
   }
 
-  const res = await fetch(url.toString(), {
+  const dispatcher = resolveProxyAgent();
+
+  const res = await undiciFetch(url.toString(), {
     method: "GET",
     headers: {
       Accept: "application/json",
       "X-Subscription-Token": params.apiKey,
     },
     signal: withTimeout(undefined, params.timeoutSeconds * 1000),
+    dispatcher,
   });
 
   if (!res.ok) {
-    const detail = await readResponseText(res);
+    const detail = await readResponseText(res as unknown as Response);
     throw new Error(`Brave Search API error (${res.status}): ${detail || res.statusText}`);
   }
 
@@ -456,6 +496,7 @@ export function createWebSearchTool(options?: {
   config?: OpenClawConfig;
   sandboxed?: boolean;
 }): AnyAgentTool | null {
+  configuredProxyUrl = resolveConfiguredProxyUrl(options?.config);
   const search = resolveSearchConfig(options?.config);
   if (!resolveSearchEnabled({ search, sandboxed: options?.sandboxed })) {
     return null;
